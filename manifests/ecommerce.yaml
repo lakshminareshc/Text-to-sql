@@ -1,0 +1,266 @@
+domain: ecommerce
+description: "E-commerce platform schema covering orders, products, customers and payments"
+
+# ── Persona ──────────────────────────────────────────────────────────────────
+persona:
+  role: "E-Commerce Analytics Analyst"
+  tone: "data-driven and concise"
+  expertise: >
+    You specialise in e-commerce metrics: revenue, conversion rates, average order
+    value (AOV), customer lifetime value, product performance, and cohort analysis.
+    You are familiar with Shopify-style data models and always filter by validated
+    order statuses when computing revenue figures.
+
+# ── Database connection (env-var names only — credentials resolved at runtime) ─
+database_connection:
+  type: postgresql
+  env_vars:
+    host:     ECOMMERCE_DB_HOST
+    port:     ECOMMERCE_DB_PORT
+    database: ECOMMERCE_DB_NAME
+    user:     ECOMMERCE_DB_USER
+    password: ECOMMERCE_DB_PASSWORD
+
+# ── Business glossary (plain-English term → SQL fragment) ────────────────────
+business_glossary:
+  "Revenue":
+    "SUM(orders.total_usd) WHERE orders.status = 'delivered'"
+
+  "AOV":
+    "AVG(orders.total_usd) WHERE orders.status NOT IN ('cancelled', 'returned')"
+
+  "Active Customers":
+    "COUNT(DISTINCT orders.customer_id) WHERE orders.created_at >= NOW() - INTERVAL '90 days'"
+
+  "Repeat Purchase Rate":
+    "COUNT(DISTINCT customer_id) FILTER (WHERE order_count > 1)::FLOAT
+     / NULLIF(COUNT(DISTINCT customer_id), 0)"
+
+  "Gross Merchandise Value (GMV)":
+    "SUM(order_items.quantity * order_items.unit_price_usd)"
+
+# ── Business rules (injected verbatim into every SQL generation prompt) ───────
+business_rules:
+  - "Only include orders with status = 'delivered' when calculating revenue."
+  - "Exclude internal test customer emails matching '%@example.com' or '%@test.com'."
+  - "Always join order_items to orders via order_id (never cross-join)."
+  - "Price fields are in USD; do not mix with other currency columns."
+  - "All SELECT queries must be read-only. Never generate INSERT, UPDATE, DELETE, or DDL."
+
+# ── Sensitivity (PII / restricted columns — SQL Validator rejects any reference) ──
+sensitivity:
+  - email
+  - full_name
+  - credit_card_last4
+  - shipping_address
+  - billing_address
+
+# ── Row limits ────────────────────────────────────────────────────────────────
+row_limits:
+  default: 500
+  max: 5000
+
+# ── Few-shot examples (question → SQL pairs for semantic retrieval) ───────────
+few_shot_examples:
+  - question: "What is the total revenue for last month?"
+    sql: |
+      SELECT ROUND(SUM(total_usd), 2) AS revenue
+      FROM orders
+      WHERE status = 'delivered'
+        AND created_at >= DATE_TRUNC('month', NOW() - INTERVAL '1 month')
+        AND created_at  < DATE_TRUNC('month', NOW())
+      LIMIT 500;
+
+  - question: "What are the top 10 best-selling products this year?"
+    sql: |
+      SELECT
+          p.name                    AS product_name,
+          SUM(oi.quantity)          AS units_sold,
+          SUM(oi.quantity * oi.unit_price_usd) AS revenue
+      FROM order_items oi
+      JOIN orders  o ON o.order_id  = oi.order_id
+      JOIN products p ON p.product_id = oi.product_id
+      WHERE o.status = 'delivered'
+        AND o.created_at >= DATE_TRUNC('year', CURRENT_DATE)
+      GROUP BY p.name
+      ORDER BY units_sold DESC
+      LIMIT 10;
+
+  - question: "How many new customers signed up each month this year?"
+    sql: |
+      SELECT
+          DATE_TRUNC('month', created_at) AS month,
+          COUNT(customer_id)              AS new_customers
+      FROM customers
+      WHERE created_at >= DATE_TRUNC('year', CURRENT_DATE)
+      GROUP BY month
+      ORDER BY month
+      LIMIT 500;
+
+  - question: "What is the average order value (AOV) by country?"
+    sql: |
+      SELECT
+          c.country_code,
+          ROUND(AVG(o.total_usd), 2) AS aov
+      FROM orders o
+      JOIN customers c ON c.customer_id = o.customer_id
+      WHERE o.status NOT IN ('cancelled', 'returned')
+      GROUP BY c.country_code
+      ORDER BY aov DESC
+      LIMIT 500;
+
+  - question: "Which payment methods are most popular?"
+    sql: |
+      SELECT
+          method,
+          COUNT(payment_id)           AS transaction_count,
+          ROUND(SUM(amount_usd), 2)   AS total_charged
+      FROM payments
+      GROUP BY method
+      ORDER BY transaction_count DESC
+      LIMIT 500;
+
+  - question: "What is the cancellation rate by product category?"
+    sql: |
+      SELECT
+          p.category,
+          COUNT(oi.item_id)                                          AS total_items,
+          COUNT(oi.item_id) FILTER (WHERE o.status = 'cancelled')   AS cancelled_items,
+          ROUND(
+              COUNT(oi.item_id) FILTER (WHERE o.status = 'cancelled')::NUMERIC
+              / NULLIF(COUNT(oi.item_id), 0) * 100, 2
+          ) AS cancellation_rate_pct
+      FROM order_items oi
+      JOIN products p ON p.product_id = oi.product_id
+      JOIN orders   o ON o.order_id   = oi.order_id
+      GROUP BY p.category
+      ORDER BY cancellation_rate_pct DESC
+      LIMIT 500;
+
+  - question: "Show me total revenue by month for the past year."
+    sql: |
+      SELECT
+          DATE_TRUNC('month', created_at) AS month,
+          ROUND(SUM(total_usd), 2)        AS revenue
+      FROM orders
+      WHERE status = 'delivered'
+        AND created_at >= NOW() - INTERVAL '1 year'
+      GROUP BY month
+      ORDER BY month
+      LIMIT 500;
+
+  - question: "How many orders are currently in 'pending' status?"
+    sql: |
+      SELECT COUNT(order_id) AS pending_orders
+      FROM orders
+      WHERE status = 'pending'
+      LIMIT 500;
+
+# ── Tables (schema definition) ────────────────────────────────────────────────
+tables:
+  - name: customers
+    description: "Registered customer accounts"
+    columns:
+      - name: customer_id
+        type: INTEGER
+        primary_key: true
+        description: "Surrogate primary key"
+      - name: email
+        type: VARCHAR(255)
+        description: "Unique customer email address"
+      - name: full_name
+        type: VARCHAR(255)
+        description: "Customer display name"
+      - name: created_at
+        type: TIMESTAMPTZ
+        description: "Account creation timestamp"
+      - name: country_code
+        type: CHAR(2)
+        description: "ISO 3166-1 alpha-2 country code"
+
+  - name: products
+    description: "Product catalogue"
+    columns:
+      - name: product_id
+        type: INTEGER
+        primary_key: true
+        description: "Surrogate primary key"
+      - name: sku
+        type: VARCHAR(64)
+        description: "Stock-keeping unit (unique)"
+      - name: name
+        type: VARCHAR(255)
+        description: "Product display name"
+      - name: category
+        type: VARCHAR(100)
+        description: "Top-level product category"
+      - name: price_usd
+        type: NUMERIC(10,2)
+        description: "Listed price in US dollars"
+      - name: stock_qty
+        type: INTEGER
+        description: "Available inventory units"
+
+  - name: orders
+    description: "Customer orders"
+    columns:
+      - name: order_id
+        type: INTEGER
+        primary_key: true
+        description: "Surrogate primary key"
+      - name: customer_id
+        type: INTEGER
+        foreign_key: "customers.customer_id"
+        description: "FK to customers"
+      - name: status
+        type: VARCHAR(32)
+        description: "pending | confirmed | shipped | delivered | cancelled"
+      - name: total_usd
+        type: NUMERIC(12,2)
+        description: "Order grand total in US dollars"
+      - name: created_at
+        type: TIMESTAMPTZ
+        description: "Order placement timestamp"
+
+  - name: order_items
+    description: "Individual line items within an order"
+    columns:
+      - name: item_id
+        type: INTEGER
+        primary_key: true
+        description: "Surrogate primary key"
+      - name: order_id
+        type: INTEGER
+        foreign_key: "orders.order_id"
+        description: "FK to orders"
+      - name: product_id
+        type: INTEGER
+        foreign_key: "products.product_id"
+        description: "FK to products"
+      - name: quantity
+        type: INTEGER
+        description: "Units purchased"
+      - name: unit_price_usd
+        type: NUMERIC(10,2)
+        description: "Price at time of purchase"
+
+  - name: payments
+    description: "Payment transactions linked to orders"
+    columns:
+      - name: payment_id
+        type: INTEGER
+        primary_key: true
+        description: "Surrogate primary key"
+      - name: order_id
+        type: INTEGER
+        foreign_key: "orders.order_id"
+        description: "FK to orders"
+      - name: method
+        type: VARCHAR(32)
+        description: "credit_card | paypal | bank_transfer | crypto"
+      - name: amount_usd
+        type: NUMERIC(12,2)
+        description: "Amount charged"
+      - name: paid_at
+        type: TIMESTAMPTZ
+        description: "Payment completion timestamp"

@@ -1,0 +1,38 @@
+# Web framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
+
+# Data validation
+pydantic>=2.9.0
+pydantic-settings>=2.6.0
+
+# LLM & orchestration
+litellm>=1.55.0
+anthropic>=0.40.0
+openai>=1.55.0
+google-generativeai>=0.8.0
+google-genai>=1.0.0
+
+# LangGraph agent framework
+langgraph>=0.2.50
+langchain>=0.3.10
+langchain-core>=0.3.20
+
+# Async HTTP
+httpx>=0.27.0
+aiohttp>=3.11.0
+
+# Retry logic
+tenacity>=9.0.0
+
+# Manifest store
+PyYAML>=6.0.2
+boto3>=1.35.0          # S3 manifest store (optional, only needed when MANIFEST_STORE_TYPE=s3)
+
+# Schema Knowledge Graph RAG
+neo4j>=5.20.0               # official async Bolt driver — AuraDB + Neo4j 5.x vector index
+asyncpg>=0.29.0             # async Postgres driver for live schema introspection
+
+# Utilities
+python-dotenv>=1.0.1

@@ -1,0 +1,517 @@
+domain: sales
+description: >
+  New-home sales and closing schema for Ryan Homes / ILG residential communities.
+  Covers leads, contracts, closings, communities, home models, lots, and sales agents.
+
+# ── Persona ──────────────────────────────────────────────────────────────────
+persona:
+  role: "Senior Sales Analytics Analyst — Ryan Homes / ILG"
+  tone: "precise, business-oriented, and concise"
+  expertise: >
+    You specialise in new-home sales pipeline metrics: net contracts, cancellations,
+    backlog value, closing velocity, and agent performance across residential communities.
+    You are familiar with homebuilder KPIs such as absorption rate, net sales per
+    community, average sales price (ASP), and options-take rate. Always present dollar
+    figures rounded to two decimal places and use community / division roll-ups where
+    appropriate.
+
+# ── Database connection (env-var names only — credentials resolved at runtime) ─
+database_connection:
+  type: postgresql
+  env_vars:
+    host:     SALES_DB_HOST
+    port:     SALES_DB_PORT
+    database: SALES_DB_NAME
+    user:     SALES_DB_USER
+    password: SALES_DB_PASSWORD
+
+# ── Business glossary (plain-English term → SQL fragment) ────────────────────
+business_glossary:
+  "Net Revenue":
+    "SUM(c.closing_revenue) FROM closings cl JOIN contracts c ON c.contract_id = cl.contract_id
+     WHERE c.contract_status = 'closed'"
+
+  "Net Sales":
+    "COUNT(c.contract_id) - COUNT(cn.cancellation_id)
+     FROM contracts c LEFT JOIN cancellations cn ON cn.contract_id = c.contract_id"
+
+  "Gross Contracts":
+    "COUNT(contract_id) FROM contracts WHERE contract_status != 'voided'"
+
+  "Cancellations":
+    "COUNT(cancellation_id) FROM cancellations WHERE is_rescission = false"
+
+  "Rescissions":
+    "COUNT(cancellation_id) FROM cancellations WHERE is_rescission = true"
+
+  "Backlog":
+    "COUNT(contract_id) FROM contracts
+     WHERE contract_status = 'signed' AND estimated_close_date > CURRENT_DATE"
+
+  "Backlog Value":
+    "SUM(total_price) FROM contracts
+     WHERE contract_status = 'signed' AND estimated_close_date > CURRENT_DATE"
+
+  "ASP":
+    "AVG(total_price) FROM contracts WHERE contract_status IN ('signed', 'closed')"
+
+  "Absorption Rate":
+    "COUNT(contract_id)::FLOAT / NULLIF(COUNT(DISTINCT community_id), 0)
+     FROM contracts WHERE contract_status != 'voided'"
+
+  "Options Take Rate":
+    "AVG(options_price / NULLIF(base_price, 0)) FROM contracts
+     WHERE contract_status IN ('signed', 'closed')"
+
+  "Cancellation Rate":
+    "COUNT(cn.cancellation_id)::FLOAT / NULLIF(COUNT(c.contract_id), 0)
+     FROM contracts c LEFT JOIN cancellations cn ON cn.contract_id = c.contract_id"
+
+  "Active Leads":
+    "COUNT(lead_id) FROM leads WHERE lead_status NOT IN ('lost', 'dead', 'duplicate')"
+
+# ── Business rules (injected verbatim into every SQL generation prompt) ───────
+business_rules:
+  - "Always exclude test communities: WHERE communities.is_test = false (or join to communities and filter)."
+  - "Always exclude inactive agents: WHERE agents.is_active = true when agent data is involved."
+  - "Voided contracts must never be counted in any sales or revenue metric."
+  - "A cancellation within 10 days of contract_date is a rescission (is_rescission = true); treat separately from standard cancellations."
+  - "All price columns (base_price, options_price, total_price, closing_revenue) are in USD."
+  - "When aggregating across divisions, always GROUP BY community.division unless the question is company-wide."
+  - "Do not expose individual buyer PII (email, phone, ssn, credit_score) in any aggregate or detail query."
+
+# ── Sensitivity (PII / restricted columns — SQL Validator rejects any reference) ──
+sensitivity:
+  - buyer_email
+  - buyer_phone
+  - buyer_ssn
+  - credit_score
+  - net_worth
+  - annual_income
+  - leads.email
+  - leads.phone
+
+# ── Row limits ────────────────────────────────────────────────────────────────
+row_limits:
+  default: 500
+  max: 10000
+
+# ── Few-shot examples (question → SQL pairs for semantic retrieval) ───────────
+few_shot_examples:
+  - question: "How many net contracts were signed in Q1 this year?"
+    sql: |
+      SELECT
+          COUNT(c.contract_id) - COUNT(cn.cancellation_id) AS net_contracts
+      FROM contracts c
+      LEFT JOIN cancellations cn ON cn.contract_id = c.contract_id
+      JOIN communities com ON com.community_id = c.community_id
+      WHERE com.is_test = false
+        AND c.contract_date >= DATE_TRUNC('quarter', CURRENT_DATE)
+        AND c.contract_date  < DATE_TRUNC('quarter', CURRENT_DATE) + INTERVAL '3 months'
+        AND c.contract_status != 'voided'
+      LIMIT 500;
+
+  - question: "What is the current backlog value by community?"
+    sql: |
+      SELECT
+          com.community_name,
+          COUNT(c.contract_id)   AS backlog_units,
+          SUM(c.total_price)     AS backlog_value
+      FROM contracts c
+      JOIN communities com ON com.community_id = c.community_id
+      WHERE c.contract_status = 'signed'
+        AND c.estimated_close_date > CURRENT_DATE
+        AND com.is_test = false
+      GROUP BY com.community_name
+      ORDER BY backlog_value DESC
+      LIMIT 500;
+
+  - question: "Which sales agents closed the most homes last month?"
+    sql: |
+      SELECT
+          a.first_name || ' ' || a.last_name AS agent_name,
+          COUNT(cl.closing_id)               AS closings
+      FROM closings cl
+      JOIN contracts c  ON c.contract_id  = cl.contract_id
+      JOIN agents a     ON a.agent_id     = c.agent_id
+      JOIN communities com ON com.community_id = c.community_id
+      WHERE a.is_active = true
+        AND com.is_test  = false
+        AND cl.actual_close_date >= DATE_TRUNC('month', NOW() - INTERVAL '1 month')
+        AND cl.actual_close_date  < DATE_TRUNC('month', NOW())
+      GROUP BY agent_name
+      ORDER BY closings DESC
+      LIMIT 500;
+
+  - question: "What is the average sales price (ASP) by home model this year?"
+    sql: |
+      SELECT
+          hm.model_name,
+          ROUND(AVG(c.total_price), 2) AS avg_sales_price
+      FROM contracts c
+      JOIN home_models hm  ON hm.model_id    = c.model_id
+      JOIN communities com ON com.community_id = c.community_id
+      WHERE c.contract_status IN ('signed', 'closed')
+        AND c.contract_date >= DATE_TRUNC('year', CURRENT_DATE)
+        AND com.is_test = false
+        AND c.contract_status != 'voided'
+      GROUP BY hm.model_name
+      ORDER BY avg_sales_price DESC
+      LIMIT 500;
+
+  - question: "Show me the cancellation rate by community for the past 90 days."
+    sql: |
+      SELECT
+          com.community_name,
+          COUNT(c.contract_id)                                     AS gross_contracts,
+          COUNT(cn.cancellation_id)                                AS cancellations,
+          ROUND(
+              COUNT(cn.cancellation_id)::NUMERIC
+              / NULLIF(COUNT(c.contract_id), 0) * 100, 2
+          )                                                        AS cancellation_rate_pct
+      FROM contracts c
+      LEFT JOIN cancellations cn ON cn.contract_id = c.contract_id AND cn.is_rescission = false
+      JOIN communities com ON com.community_id = c.community_id
+      WHERE c.contract_date >= CURRENT_DATE - INTERVAL '90 days'
+        AND c.contract_status != 'voided'
+        AND com.is_test = false
+      GROUP BY com.community_name
+      ORDER BY cancellation_rate_pct DESC
+      LIMIT 500;
+
+  - question: "What is the absorption rate per community month-to-date?"
+    sql: |
+      SELECT
+          com.community_name,
+          ROUND(
+              COUNT(c.contract_id)::NUMERIC
+              / NULLIF(COUNT(DISTINCT c.community_id), 0), 2
+          ) AS absorption_rate
+      FROM contracts c
+      JOIN communities com ON com.community_id = c.community_id
+      WHERE c.contract_date >= DATE_TRUNC('month', CURRENT_DATE)
+        AND c.contract_status != 'voided'
+        AND com.is_test = false
+      GROUP BY com.community_name
+      ORDER BY absorption_rate DESC
+      LIMIT 500;
+
+  - question: "List all communities currently active with their lot inventory."
+    sql: |
+      SELECT
+          com.community_name,
+          com.city,
+          com.state,
+          COUNT(l.lot_id)                                        AS total_lots,
+          COUNT(l.lot_id) FILTER (WHERE l.lot_status = 'available') AS available_lots,
+          COUNT(l.lot_id) FILTER (WHERE l.lot_status = 'sold')      AS sold_lots
+      FROM communities com
+      LEFT JOIN lots l ON l.community_id = com.community_id
+      WHERE com.community_status = 'active'
+        AND com.is_test = false
+      GROUP BY com.community_name, com.city, com.state
+      ORDER BY com.community_name
+      LIMIT 500;
+
+  - question: "What were total closings revenue and unit count for the fiscal year to date?"
+    sql: |
+      SELECT
+          COUNT(cl.closing_id)        AS closed_units,
+          SUM(cl.closing_revenue)     AS total_revenue
+      FROM closings cl
+      JOIN contracts c  ON c.contract_id  = cl.contract_id
+      JOIN communities com ON com.community_id = c.community_id
+      WHERE cl.actual_close_date >= DATE_TRUNC('year', CURRENT_DATE)
+        AND com.is_test = false;
+
+  - question: "How many leads were generated per source last quarter?"
+    sql: |
+      SELECT
+          l.lead_source,
+          COUNT(l.lead_id) AS leads
+      FROM leads l
+      JOIN communities com ON com.community_id = l.community_id
+      WHERE l.created_at >= DATE_TRUNC('quarter', NOW() - INTERVAL '3 months')
+        AND l.created_at  < DATE_TRUNC('quarter', NOW())
+        AND com.is_test = false
+      GROUP BY l.lead_source
+      ORDER BY leads DESC
+      LIMIT 500;
+
+  - question: "Show the top 10 communities by net sales this month."
+    sql: |
+      SELECT
+          com.community_name,
+          COUNT(c.contract_id) - COUNT(cn.cancellation_id) AS net_sales
+      FROM contracts c
+      LEFT JOIN cancellations cn ON cn.contract_id = c.contract_id
+      JOIN communities com ON com.community_id = c.community_id
+      WHERE c.contract_date >= DATE_TRUNC('month', CURRENT_DATE)
+        AND c.contract_status != 'voided'
+        AND com.is_test = false
+      GROUP BY com.community_name
+      ORDER BY net_sales DESC
+      LIMIT 10;
+
+  - question: "What is the average options take rate across all closed homes this year?"
+    sql: |
+      SELECT
+          ROUND(
+              AVG(c.options_price / NULLIF(c.base_price, 0)) * 100, 2
+          ) AS options_take_rate_pct
+      FROM contracts c
+      JOIN communities com ON com.community_id = c.community_id
+      WHERE c.contract_status = 'closed'
+        AND c.contract_date >= DATE_TRUNC('year', CURRENT_DATE)
+        AND com.is_test = false;
+
+  - question: "Which divisions had the highest revenue last year?"
+    sql: |
+      SELECT
+          com.division,
+          SUM(cl.closing_revenue) AS total_revenue,
+          COUNT(cl.closing_id)    AS closed_units
+      FROM closings cl
+      JOIN contracts c  ON c.contract_id   = cl.contract_id
+      JOIN communities com ON com.community_id = c.community_id
+      WHERE cl.actual_close_date >= DATE_TRUNC('year', NOW() - INTERVAL '1 year')
+        AND cl.actual_close_date  < DATE_TRUNC('year', NOW())
+        AND com.is_test = false
+      GROUP BY com.division
+      ORDER BY total_revenue DESC
+      LIMIT 500;
+
+# ── Tables (schema definition) ────────────────────────────────────────────────
+tables:
+  - name: communities
+    description: "Active and historical residential communities (subdivisions)"
+    columns:
+      - name: community_id
+        type: INTEGER
+        primary_key: true
+        description: "Surrogate primary key"
+      - name: community_name
+        type: VARCHAR(200)
+        description: "Marketing display name of the community"
+      - name: division
+        type: VARCHAR(100)
+        description: "Regional division (e.g. Mid-Atlantic, Southeast, Midwest)"
+      - name: city
+        type: VARCHAR(100)
+        description: "City where the community is located"
+      - name: state
+        type: CHAR(2)
+        description: "US state abbreviation"
+      - name: community_status
+        type: VARCHAR(32)
+        description: "active | sold_out | closed | on_hold"
+      - name: is_test
+        type: BOOLEAN
+        description: "True for internal test / demo communities — always exclude from reports"
+      - name: open_date
+        type: DATE
+        description: "Date community opened for sales"
+      - name: close_date
+        type: DATE
+        description: "Date community sold out or closed (NULL if still active)"
+
+  - name: lots
+    description: "Individual lots within a community"
+    columns:
+      - name: lot_id
+        type: INTEGER
+        primary_key: true
+        description: "Surrogate primary key"
+      - name: community_id
+        type: INTEGER
+        foreign_key: "communities.community_id"
+        description: "FK to communities"
+      - name: lot_number
+        type: VARCHAR(20)
+        description: "Builder lot identifier (e.g. '42A')"
+      - name: lot_status
+        type: VARCHAR(32)
+        description: "available | reserved | sold | closed"
+      - name: square_footage
+        type: INTEGER
+        description: "Lot area in square feet"
+
+  - name: home_models
+    description: "Floor plan / home model definitions per community"
+    columns:
+      - name: model_id
+        type: INTEGER
+        primary_key: true
+        description: "Surrogate primary key"
+      - name: community_id
+        type: INTEGER
+        foreign_key: "communities.community_id"
+        description: "FK to communities"
+      - name: model_name
+        type: VARCHAR(150)
+        description: "Marketing plan name (e.g. 'The Ridgeline', 'Ellsworth II')"
+      - name: square_footage
+        type: INTEGER
+        description: "Finished living area in square feet"
+      - name: bedrooms
+        type: SMALLINT
+        description: "Number of bedrooms"
+      - name: bathrooms
+        type: NUMERIC(3,1)
+        description: "Number of bathrooms (e.g. 2.5)"
+      - name: base_price
+        type: NUMERIC(12,2)
+        description: "Published base price in USD"
+      - name: plan_type
+        type: VARCHAR(50)
+        description: "single_family | townhome | condo | villa"
+
+  - name: agents
+    description: "Sales agents assigned to communities"
+    columns:
+      - name: agent_id
+        type: INTEGER
+        primary_key: true
+        description: "Surrogate primary key"
+      - name: first_name
+        type: VARCHAR(100)
+        description: "Agent first name"
+      - name: last_name
+        type: VARCHAR(100)
+        description: "Agent last name"
+      - name: community_id
+        type: INTEGER
+        foreign_key: "communities.community_id"
+        description: "Primary community assignment"
+      - name: is_active
+        type: BOOLEAN
+        description: "False for terminated or inactive agents"
+      - name: hire_date
+        type: DATE
+        description: "Date agent was hired"
+
+  - name: leads
+    description: "Prospective buyer lead records"
+    columns:
+      - name: lead_id
+        type: INTEGER
+        primary_key: true
+        description: "Surrogate primary key"
+      - name: community_id
+        type: INTEGER
+        foreign_key: "communities.community_id"
+        description: "Community the lead is interested in"
+      - name: assigned_agent_id
+        type: INTEGER
+        foreign_key: "agents.agent_id"
+        description: "Agent handling this lead (nullable)"
+      - name: first_name
+        type: VARCHAR(100)
+        description: "Buyer first name"
+      - name: last_name
+        type: VARCHAR(100)
+        description: "Buyer last name"
+      - name: email
+        type: VARCHAR(255)
+        description: "Contact email — PII, restricted"
+      - name: phone
+        type: VARCHAR(30)
+        description: "Contact phone — PII, restricted"
+      - name: lead_source
+        type: VARCHAR(100)
+        description: "organic | paid_search | referral | model_walk_in | realtor | direct_mail"
+      - name: lead_status
+        type: VARCHAR(50)
+        description: "new | active | nurture | contracted | lost | dead | duplicate"
+      - name: created_at
+        type: TIMESTAMPTZ
+        description: "Timestamp when the lead was first captured"
+
+  - name: contracts
+    description: "Purchase contracts (new home sales agreements)"
+    columns:
+      - name: contract_id
+        type: INTEGER
+        primary_key: true
+        description: "Surrogate primary key"
+      - name: lead_id
+        type: INTEGER
+        foreign_key: "leads.lead_id"
+        description: "FK to leads — the buyer"
+      - name: community_id
+        type: INTEGER
+        foreign_key: "communities.community_id"
+        description: "FK to communities"
+      - name: lot_id
+        type: INTEGER
+        foreign_key: "lots.lot_id"
+        description: "Lot being purchased"
+      - name: model_id
+        type: INTEGER
+        foreign_key: "home_models.model_id"
+        description: "Floor plan selected"
+      - name: agent_id
+        type: INTEGER
+        foreign_key: "agents.agent_id"
+        description: "Agent who wrote the contract"
+      - name: base_price
+        type: NUMERIC(12,2)
+        description: "Base home price at time of contract in USD"
+      - name: options_price
+        type: NUMERIC(12,2)
+        description: "Structural and design-center options total in USD"
+      - name: total_price
+        type: NUMERIC(12,2)
+        description: "base_price + options_price in USD"
+      - name: contract_status
+        type: VARCHAR(32)
+        description: "signed | closed | cancelled | voided"
+      - name: contract_date
+        type: DATE
+        description: "Date the purchase agreement was executed"
+      - name: estimated_close_date
+        type: DATE
+        description: "Projected closing / settlement date"
+
+  - name: cancellations
+    description: "Contract cancellation records"
+    columns:
+      - name: cancellation_id
+        type: INTEGER
+        primary_key: true
+        description: "Surrogate primary key"
+      - name: contract_id
+        type: INTEGER
+        foreign_key: "contracts.contract_id"
+        description: "FK to the cancelled contract"
+      - name: cancel_date
+        type: DATE
+        description: "Date the cancellation was processed"
+      - name: cancel_reason
+        type: VARCHAR(200)
+        description: "Reason code or free-text reason for cancellation"
+      - name: is_rescission
+        type: BOOLEAN
+        description: "True when cancellation is within the 10-day rescission window"
+
+  - name: closings
+    description: "Settlement / closing records for completed contracts"
+    columns:
+      - name: closing_id
+        type: INTEGER
+        primary_key: true
+        description: "Surrogate primary key"
+      - name: contract_id
+        type: INTEGER
+        foreign_key: "contracts.contract_id"
+        description: "FK to the closed contract"
+      - name: actual_close_date
+        type: DATE
+        description: "Actual date of settlement"
+      - name: closing_revenue
+        type: NUMERIC(12,2)
+        description: "Final settlement amount received in USD"
+      - name: agent_id
+        type: INTEGER
+        foreign_key: "agents.agent_id"
+        description: "Agent credited for the closing"

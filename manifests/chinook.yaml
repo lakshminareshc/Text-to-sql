@@ -1,0 +1,209 @@
+domain: chinook
+description: >
+  Chinook digital music store database. Covers artists, albums, tracks, playlists,
+  customers, invoices, employees, and media types. Use this domain for music
+  catalog analytics, sales revenue, customer purchasing behaviour, and employee
+  performance reporting.
+
+# ── Persona ───────────────────────────────────────────────────────────────────
+persona:
+  role: "Music Store Data Analyst — Chinook Digital Music"
+  tone: "precise, data-driven, and concise"
+  expertise: >
+    You specialise in digital music store analytics: track sales revenue, top artists
+    and albums, customer purchase behaviour, playlist usage, and employee support
+    performance. You are familiar with music store KPIs such as revenue per customer,
+    top-selling genres, invoice totals, and average order value. Always present
+    monetary values rounded to two decimal places and qualify column names with table
+    aliases when joins are present.
+
+# ── Database connection (env-var names only — credentials resolved at runtime) ─
+database_connection:
+  type: postgresql
+  env_vars:
+    host:     CHINOOK_DB_HOST
+    port:     CHINOOK_DB_PORT
+    database: CHINOOK_DB_NAME
+    user:     CHINOOK_DB_USER
+    password: CHINOOK_DB_PASSWORD
+
+# ── Business glossary (plain-English term → SQL fragment) ────────────────────
+business_glossary:
+  "Total Revenue":    "SUM(il.unit_price * il.quantity) FROM invoice_line il"
+
+  "Revenue by Genre": >
+    SUM(il.unit_price * il.quantity) FROM invoice_line il
+    JOIN track t ON t.track_id = il.track_id
+    JOIN genre g ON g.genre_id = t.genre_id
+    GROUP BY g.name
+
+  "Top Selling Tracks": >
+    SUM(il.quantity) AS units_sold FROM invoice_line il
+    JOIN track t ON t.track_id = il.track_id
+    GROUP BY t.name ORDER BY units_sold DESC
+
+  "Average Order Value": "ROUND(AVG(i.total), 2) FROM invoice i"
+
+  "Revenue per Customer": >
+    SUM(i.total) FROM invoice i
+    JOIN customer c ON c.customer_id = i.customer_id
+    GROUP BY c.customer_id, c.first_name, c.last_name
+
+  "Track Duration (minutes)": "ROUND(t.milliseconds / 60000.0, 2)"
+
+  "Active Customers": >
+    COUNT(DISTINCT i.customer_id) FROM invoice i
+    WHERE i.invoice_date >= CURRENT_DATE - INTERVAL '12 months'
+
+# ── Business rules (injected verbatim into every SQL prompt) ─────────────────
+business_rules:
+  - "Always qualify column names with their table alias when any JOIN is present."
+  - "Monetary columns (unit_price, total) are stored in USD — round to 2 decimal places."
+  - "Track duration is stored in milliseconds — convert to minutes with / 60000.0 when displaying."
+  - "Track file size is stored in bytes — convert to MB with / 1048576.0 when displaying."
+  - "Use ILIKE for case-insensitive name searches (e.g. artist name, genre name)."
+  - "employee.reports_to is a self-referencing FK to employee.employee_id — use a self-join or alias when traversing the hierarchy."
+
+# ── Sensitivity (PII / restricted columns — SQL Validator rejects references) ─
+sensitivity:
+  - customer.email
+  - customer.phone
+  - customer.address
+  - customer.postal_code
+  - employee.email
+  - employee.phone
+  - employee.address
+  - employee.birth_date
+
+# ── Row limits ────────────────────────────────────────────────────────────────
+row_limits:
+  default: 100
+  max:     2000
+
+# ── Few-shot examples ─────────────────────────────────────────────────────────
+few_shot_examples:
+  - question: "What are the top 10 best-selling tracks of all time?"
+    sql: |
+      SELECT
+          t.name                          AS track_name,
+          ar.name                         AS artist_name,
+          SUM(il.quantity)                AS units_sold,
+          ROUND(SUM(il.unit_price * il.quantity), 2) AS total_revenue
+      FROM invoice_line il
+      JOIN track  t  ON t.track_id  = il.track_id
+      JOIN album  al ON al.album_id = t.album_id
+      JOIN artist ar ON ar.artist_id = al.artist_id
+      GROUP BY t.track_id, t.name, ar.name
+      ORDER BY units_sold DESC
+      LIMIT 10;
+
+  - question: "What is the total revenue per genre?"
+    sql: |
+      SELECT
+          g.name                                      AS genre,
+          ROUND(SUM(il.unit_price * il.quantity), 2)  AS total_revenue,
+          SUM(il.quantity)                            AS tracks_sold
+      FROM invoice_line il
+      JOIN track t ON t.track_id = il.track_id
+      JOIN genre g ON g.genre_id = t.genre_id
+      GROUP BY g.genre_id, g.name
+      ORDER BY total_revenue DESC
+      LIMIT 100;
+
+  - question: "Which customers have spent the most money?"
+    sql: |
+      SELECT
+          c.customer_id,
+          c.first_name || ' ' || c.last_name  AS customer_name,
+          c.country,
+          ROUND(SUM(i.total), 2)              AS total_spent
+      FROM customer c
+      JOIN invoice i ON i.customer_id = c.customer_id
+      GROUP BY c.customer_id, c.first_name, c.last_name, c.country
+      ORDER BY total_spent DESC
+      LIMIT 100;
+
+  - question: "Show monthly revenue for the past 12 months."
+    sql: |
+      SELECT
+          DATE_TRUNC('month', i.invoice_date)  AS month,
+          ROUND(SUM(i.total), 2)               AS monthly_revenue,
+          COUNT(DISTINCT i.invoice_id)         AS invoice_count
+      FROM invoice i
+      WHERE i.invoice_date >= CURRENT_DATE - INTERVAL '12 months'
+      GROUP BY DATE_TRUNC('month', i.invoice_date)
+      ORDER BY month DESC
+      LIMIT 100;
+
+  - question: "What are the top 5 countries by revenue?"
+    sql: |
+      SELECT
+          c.country,
+          ROUND(SUM(i.total), 2) AS total_revenue,
+          COUNT(DISTINCT c.customer_id) AS customer_count
+      FROM invoice i
+      JOIN customer c ON c.customer_id = i.customer_id
+      GROUP BY c.country
+      ORDER BY total_revenue DESC
+      LIMIT 5;
+
+  - question: "List all artists with their total album count and track count."
+    sql: |
+      SELECT
+          ar.name                      AS artist_name,
+          COUNT(DISTINCT al.album_id)  AS album_count,
+          COUNT(DISTINCT t.track_id)   AS track_count
+      FROM artist ar
+      LEFT JOIN album al ON al.artist_id = ar.artist_id
+      LEFT JOIN track t  ON t.album_id   = al.album_id
+      GROUP BY ar.artist_id, ar.name
+      ORDER BY track_count DESC
+      LIMIT 100;
+
+  - question: "Which employee supports the most customers?"
+    sql: |
+      SELECT
+          e.first_name || ' ' || e.last_name  AS employee_name,
+          e.title,
+          COUNT(c.customer_id)                AS customer_count
+      FROM employee e
+      LEFT JOIN customer c ON c.support_rep_id = e.employee_id
+      GROUP BY e.employee_id, e.first_name, e.last_name, e.title
+      ORDER BY customer_count DESC
+      LIMIT 100;
+
+  - question: "What is the average track duration per genre in minutes?"
+    sql: |
+      SELECT
+          g.name                                        AS genre,
+          ROUND(AVG(t.milliseconds) / 60000.0, 2)      AS avg_duration_minutes,
+          COUNT(t.track_id)                             AS track_count
+      FROM track t
+      JOIN genre g ON g.genre_id = t.genre_id
+      GROUP BY g.genre_id, g.name
+      ORDER BY avg_duration_minutes DESC
+      LIMIT 100;
+
+  - question: "Show all playlists and how many tracks each contains."
+    sql: |
+      SELECT
+          p.name              AS playlist_name,
+          COUNT(pt.track_id)  AS track_count
+      FROM playlist p
+      LEFT JOIN playlist_track pt ON pt.playlist_id = p.playlist_id
+      GROUP BY p.playlist_id, p.name
+      ORDER BY track_count DESC
+      LIMIT 100;
+
+  - question: "What is the average invoice total per country?"
+    sql: |
+      SELECT
+          c.country,
+          ROUND(AVG(i.total), 2)        AS avg_invoice_total,
+          COUNT(i.invoice_id)           AS invoice_count
+      FROM invoice i
+      JOIN customer c ON c.customer_id = i.customer_id
+      GROUP BY c.country
+      ORDER BY avg_invoice_total DESC
+      LIMIT 100;
+

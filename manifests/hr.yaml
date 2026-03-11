@@ -1,0 +1,269 @@
+domain: hr
+description: "Human-resources schema covering employees, departments, payroll and leave"
+
+# ── Persona ──────────────────────────────────────────────────────────────────
+persona:
+  role: "HR Analytics Analyst"
+  tone: "objective, neutral, and policy-compliant"
+  expertise: >
+    You specialise in workforce analytics: headcount, attrition, payroll cost,
+    leave utilisation, and organisational structure. You handle sensitive employee
+    data with strict confidentiality and never expose individual salary or personal
+    details in aggregate reports without explicit authorisation.
+
+# ── Database connection (env-var names only — credentials resolved at runtime) ─
+database_connection:
+  type: postgresql
+  env_vars:
+    host:     HR_DB_HOST
+    port:     HR_DB_PORT
+    database: HR_DB_NAME
+    user:     HR_DB_USER
+    password: HR_DB_PASSWORD
+
+# ── Business glossary (plain-English term → SQL fragment) ────────────────────
+business_glossary:
+  "Headcount":
+    "COUNT(employee_id) FROM employees WHERE termination_date IS NULL"
+
+  "Attrition Rate":
+    "COUNT(employee_id) FILTER (WHERE termination_date IS NOT NULL
+     AND termination_date >= DATE_TRUNC('year', CURRENT_DATE))::FLOAT
+     / NULLIF(COUNT(employee_id), 0) FROM employees"
+
+  "Average Tenure":
+    "AVG(EXTRACT(YEAR FROM AGE(COALESCE(termination_date, CURRENT_DATE), hire_date)))
+     FROM employees"
+
+  "Total Payroll Cost":
+    "SUM(gross_salary) FROM payroll WHERE period_year = EXTRACT(YEAR FROM CURRENT_DATE)"
+
+  "Leave Utilisation Rate":
+    "SUM(lr.end_date - lr.start_date + 1)::FLOAT / NULLIF(COUNT(DISTINCT e.employee_id), 0)
+     FROM leave_requests lr JOIN employees e ON e.employee_id = lr.employee_id
+     WHERE lr.status = 'approved'"
+
+# ── Business rules (injected verbatim into every SQL generation prompt) ───────
+business_rules:
+  - "Active employees are those WHERE termination_date IS NULL; always apply this filter unless historical data is requested."
+  - "Never expose individual salary values (gross_salary, net_salary) for fewer than 5 employees — aggregate only."
+  - "Leave requests must be filtered by status = 'approved' unless the question specifically asks about pending or rejected requests."
+  - "Manager relationships are expressed via departments.manager_id → employees.employee_id."
+  - "All SELECT queries must be read-only. Never generate INSERT, UPDATE, DELETE, or DDL."
+
+# ── Sensitivity (PII / restricted columns — SQL Validator rejects any reference) ──
+sensitivity:
+  - email
+  - gross_salary
+  - net_salary
+  - hire_date
+  - termination_date
+
+# ── Row limits ────────────────────────────────────────────────────────────────
+row_limits:
+  default: 200
+  max: 2000
+
+# ── Few-shot examples (question → SQL pairs for semantic retrieval) ───────────
+few_shot_examples:
+  - question: "How many active employees are there in each department?"
+    sql: |
+      SELECT
+          d.name          AS department,
+          COUNT(e.employee_id) AS headcount
+      FROM employees e
+      JOIN departments d ON d.department_id = e.department_id
+      WHERE e.termination_date IS NULL
+      GROUP BY d.name
+      ORDER BY headcount DESC
+      LIMIT 200;
+
+  - question: "What is the attrition rate this year by department?"
+    sql: |
+      SELECT
+          d.name AS department,
+          COUNT(e.employee_id)                                                      AS total_employees,
+          COUNT(e.employee_id) FILTER (WHERE e.termination_date >= DATE_TRUNC('year', CURRENT_DATE)) AS departed,
+          ROUND(
+              COUNT(e.employee_id) FILTER (WHERE e.termination_date >= DATE_TRUNC('year', CURRENT_DATE))::NUMERIC
+              / NULLIF(COUNT(e.employee_id), 0) * 100, 2
+          ) AS attrition_rate_pct
+      FROM employees e
+      JOIN departments d ON d.department_id = e.department_id
+      GROUP BY d.name
+      ORDER BY attrition_rate_pct DESC
+      LIMIT 200;
+
+  - question: "What is the total payroll cost by department this year?"
+    sql: |
+      SELECT
+          d.name              AS department,
+          SUM(p.gross_salary) AS total_payroll
+      FROM payroll p
+      JOIN employees   e ON e.employee_id   = p.employee_id
+      JOIN departments d ON d.department_id = e.department_id
+      WHERE p.period_year = EXTRACT(YEAR FROM CURRENT_DATE)
+        AND e.termination_date IS NULL
+      GROUP BY d.name
+      ORDER BY total_payroll DESC
+      LIMIT 200;
+
+  - question: "Which employees have been with the company the longest?"
+    sql: |
+      SELECT
+          e.first_name || ' ' || e.last_name                        AS employee_name,
+          d.name                                                     AS department,
+          e.job_title,
+          ROUND(EXTRACT(YEAR FROM AGE(CURRENT_DATE, e.hire_date))::NUMERIC, 1) AS years_of_service
+      FROM employees e
+      JOIN departments d ON d.department_id = e.department_id
+      WHERE e.termination_date IS NULL
+      ORDER BY e.hire_date ASC
+      LIMIT 10;
+
+  - question: "How many approved leave days were taken per department this year?"
+    sql: |
+      SELECT
+          d.name            AS department,
+          SUM(lr.end_date - lr.start_date + 1) AS total_leave_days
+      FROM leave_requests lr
+      JOIN employees   e ON e.employee_id   = lr.employee_id
+      JOIN departments d ON d.department_id = e.department_id
+      WHERE lr.status = 'approved'
+        AND lr.start_date >= DATE_TRUNC('year', CURRENT_DATE)
+      GROUP BY d.name
+      ORDER BY total_leave_days DESC
+      LIMIT 200;
+
+  - question: "How many employees were hired each quarter last year?"
+    sql: |
+      SELECT
+          DATE_TRUNC('quarter', hire_date) AS quarter,
+          COUNT(employee_id)               AS new_hires
+      FROM employees
+      WHERE hire_date >= DATE_TRUNC('year', NOW() - INTERVAL '1 year')
+        AND hire_date  < DATE_TRUNC('year', NOW())
+      GROUP BY quarter
+      ORDER BY quarter
+      LIMIT 200;
+
+  - question: "What leave types are most commonly approved?"
+    sql: |
+      SELECT
+          leave_type,
+          COUNT(leave_id)                      AS request_count,
+          SUM(end_date - start_date + 1)       AS total_days
+      FROM leave_requests
+      WHERE status = 'approved'
+      GROUP BY leave_type
+      ORDER BY request_count DESC
+      LIMIT 200;
+
+  - question: "Who are the department managers and how large are their teams?"
+    sql: |
+      SELECT
+          d.name                                    AS department,
+          m.first_name || ' ' || m.last_name        AS manager_name,
+          COUNT(e.employee_id)                      AS team_size
+      FROM departments d
+      JOIN employees m ON m.employee_id = d.manager_id
+      LEFT JOIN employees e ON e.department_id = d.department_id
+                            AND e.termination_date IS NULL
+      GROUP BY d.name, manager_name
+      ORDER BY team_size DESC
+      LIMIT 200;
+
+# ── Tables (schema definition) ────────────────────────────────────────────────
+tables:
+  - name: departments
+    description: "Organisational departments"
+    columns:
+      - name: department_id
+        type: INTEGER
+        primary_key: true
+        description: "Surrogate primary key"
+      - name: name
+        type: VARCHAR(100)
+        description: "Department name"
+      - name: manager_id
+        type: INTEGER
+        foreign_key: "employees.employee_id"
+        description: "FK to the department manager (nullable)"
+
+  - name: employees
+    description: "Current and former employees"
+    columns:
+      - name: employee_id
+        type: INTEGER
+        primary_key: true
+        description: "Surrogate primary key"
+      - name: first_name
+        type: VARCHAR(100)
+        description: "Given name"
+      - name: last_name
+        type: VARCHAR(100)
+        description: "Family name"
+      - name: email
+        type: VARCHAR(255)
+        description: "Work email (unique)"
+      - name: department_id
+        type: INTEGER
+        foreign_key: "departments.department_id"
+        description: "FK to departments"
+      - name: job_title
+        type: VARCHAR(150)
+        description: "Current job title"
+      - name: hire_date
+        type: DATE
+        description: "Start date"
+      - name: termination_date
+        type: DATE
+        description: "Termination date (NULL if still active)"
+
+  - name: payroll
+    description: "Monthly payroll records"
+    columns:
+      - name: payroll_id
+        type: INTEGER
+        primary_key: true
+        description: "Surrogate primary key"
+      - name: employee_id
+        type: INTEGER
+        foreign_key: "employees.employee_id"
+        description: "FK to employees"
+      - name: period_year
+        type: SMALLINT
+        description: "Calendar year"
+      - name: period_month
+        type: SMALLINT
+        description: "Calendar month (1-12)"
+      - name: gross_salary
+        type: NUMERIC(12,2)
+        description: "Gross pay before deductions"
+      - name: net_salary
+        type: NUMERIC(12,2)
+        description: "Take-home pay after deductions"
+
+  - name: leave_requests
+    description: "Employee leave / time-off requests"
+    columns:
+      - name: leave_id
+        type: INTEGER
+        primary_key: true
+        description: "Surrogate primary key"
+      - name: employee_id
+        type: INTEGER
+        foreign_key: "employees.employee_id"
+        description: "FK to employees"
+      - name: leave_type
+        type: VARCHAR(32)
+        description: "annual | sick | unpaid | parental"
+      - name: start_date
+        type: DATE
+        description: "First day of leave"
+      - name: end_date
+        type: DATE
+        description: "Last day of leave"
+      - name: status
+        type: VARCHAR(16)
+        description: "pending | approved | rejected"
